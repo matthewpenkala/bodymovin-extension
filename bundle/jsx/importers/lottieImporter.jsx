@@ -34,7 +34,6 @@ $.__bodymovin.bm_lottieImporter = (function () {
 		var comp = app.project.items.addComp(name, width, height, 1, duration / frameRate, frameRate);
 		addElement(id, comp);
 		comp.parentFolder = mainFolder;
-		//'bm_charHelper', 1000, 1000, 1, 1, 1
 	}
 
 	function setCompWorkArea(inPoint, outPoint, id) {
@@ -45,29 +44,24 @@ $.__bodymovin.bm_lottieImporter = (function () {
 
 	function createNull(duration, elementId, parentCompId) {
 		var comp = getElementById(parentCompId);
-
 		var element = comp.layers.addNull(duration / frameRate);
 		addElement(elementId, element);
 	}
 
 	function createSolid(color, name, width, height, duration, elementId, parentCompId) {
 		var comp = getElementById(parentCompId);
-		// comp.layers.addSolid(color, name, width, height, 1, duration);
-
 		var element = comp.layers.addSolid(color, name, width, height, 1, duration / frameRate);
 		addElement(elementId, element);
 	}
 
 	function createShapeLayer(elementId, parentCompId) {
 		var comp = getElementById(parentCompId);
-
 		var element = comp.layers.addShape();
 		addElement(elementId, element);
 	}
 
 	function createTextLayer(elementId, parentCompId) {
 		var comp = getElementById(parentCompId);
-
 		var element = comp.layers.addText('');
 		addElement(elementId, element);
 	}
@@ -160,15 +154,14 @@ $.__bodymovin.bm_lottieImporter = (function () {
 
 	function setElementPropertyExpression(propertyName, value, elementId) {
 		var element = getElementById(elementId);
-		// element[propertyName].expression = 'time';
 		element[propertyName].expression = decodeURIComponent(value);
 	}
 
 	function setElementKey(propertyName, time, value, elementId) {
 		var element = getElementById(elementId);
-		// This case covers Grandients that can't be set via scripting
+		// This case is now handled entirely by the new gradient functions.
 		if (propertyName === 'Colors') {
-			element[propertyName].addKey(time / frameRate);
+			// This path should not be taken for gradients anymore.
 		} else {
 			element[propertyName].setValueAtTime(time / frameRate, formatValue(propertyName, value));
 		}
@@ -245,21 +238,7 @@ $.__bodymovin.bm_lottieImporter = (function () {
 		var elementProperty = property.addProperty("ADBE Vector Graphic - Fill");
 		addElement(elementId, elementProperty);
 	}
-
-	function createGradientFill(elementId, containerId) {
-		var element = getElementById(containerId);
-		var property = element.property("Contents");
-		var elementProperty = property.addProperty("ADBE Vector Graphic - G-Fill");
-		addElement(elementId, elementProperty);
-	}
-
-	function createGradientStroke(elementId, containerId) {
-		var element = getElementById(containerId);
-		var property = element.property("Contents");
-		var elementProperty = property.addProperty("ADBE Vector Graphic - G-Stroke");
-		addElement(elementId, elementProperty);
-	}
-
+	
 	function createStroke(elementId, containerId) {
 		var element = getElementById(containerId);
 		var property = element.property("Contents");
@@ -410,6 +389,181 @@ $.__bodymovin.bm_lottieImporter = (function () {
 			footage.parentFolder = mainFolder;
 		}
 	}
+
+	// =================================================================================================
+	// =================================================================================================
+	// START OF NEW GRADIENT FUNCTIONS
+	// =================================================================================================
+	// =================================================================================================
+
+	// Sets a property value, creating keyframes if the data is animated.
+	function setAnimatableProperty(prop, data) {
+		if (data.a === 1) { // If animated
+			// Note: This simplified version does not handle easing.
+			// A full implementation would need to parse temporal ease properties (o, i)
+			// and spatial tangents for path data.
+			for (var i = 0; i < data.k.length; i++) {
+				var key = data.k[i];
+				if(key.s) {
+					var time = key.t / frameRate;
+					var value = formatValue(null, key.s);
+					prop.setValueAtTime(time, value);
+				}
+			}
+		} else { // If static
+			var staticValue = formatValue(null, data.k);
+			prop.setValue(staticValue);
+		}
+	}
+
+	// Master function to apply a gradient preset and set its values.
+	// This function contains the core workaround logic.
+	function createAndApplyGradient(container, gradientData, propertyMatchName) {
+		try {
+			var stops = [];
+			var rawStops = gradientData.g.k.k;
+			if (typeof rawStops[0] !== 'number') {
+				// Fallback for incorrectly structured static gradient data
+				rawStops = rawStops[0].s ? rawStops[0].s[0] : rawStops[0];
+			}
+			
+			// Deconstruct the flat array of stops from Lottie into an array of objects
+			for(var i = 0; i < gradientData.g.p; i++) {
+				stops.push({
+					position: rawStops[i * 4],
+					color: [rawStops[i * 4 + 1], rawStops[i * 4 + 2], rawStops[i * 4 + 3]],
+					// Lottie format doesn't have a separate alpha ramp, so opacity is always 1
+					opacity: 1, 
+					midPoint: 0.5 // Default midpoint
+				});
+			}
+
+			// Dynamically generate the XML part of the .ffx file
+			var ffxString = generateFfxString(stops, propertyMatchName);
+			if (!ffxString) {
+				bm_eventDispatcher.log("Could not generate .ffx string.");
+				return null;
+			}
+
+			// Write the dynamically generated string to a temporary file
+			var tempFile = new File(Folder.temp.fsName + "/bm_temp_grad.ffx");
+			tempFile.encoding = "BINARY";
+			tempFile.open("w");
+			tempFile.write(ffxString);
+			tempFile.close();
+			
+			if (!tempFile.exists) {
+				bm_eventDispatcher.log("Failed to create temporary preset file.");
+				return null;
+			}
+			
+			// Get the parent layer of the shape group where the gradient will be added
+			var targetLayer = container.propertyGroup(container.propertyDepth);
+
+			// Apply the preset. This is the magic that creates the gradient property
+			// with a scriptable color ramp.
+			targetLayer.applyPreset(tempFile);
+
+			// Find the newly created property. It should be the last one.
+			var gradientProperty = container.property("Contents").property(container.property("Contents").numProperties);
+			
+			// Check if the preset application was successful
+			if (gradientProperty.matchName !== propertyMatchName) {
+				bm_eventDispatcher.log("Applying preset failed to create the correct gradient property. Expected: " + propertyMatchName + " but got: " + gradientProperty.matchName);
+				tempFile.remove();
+				return null;
+			}
+			
+			// --- Set the rest of the gradient properties from the Lottie data ---
+			gradientProperty.name = decodeURIComponent(gradientData.nm);
+			setAnimatableProperty(gradientProperty.property("Opacity"), gradientData.o);
+			setAnimatableProperty(gradientProperty.property("Start Point"), gradientData.s);
+			setAnimatableProperty(gradientProperty.property("End Point"), gradientData.e);
+			gradientProperty.property("Type").setValue(gradientData.t === 1 ? 1 : 2); // 1: Linear, 2: Radial
+			
+			// If the gradient is animated, we have to set keyframes on the "Colors" property
+			if (gradientData.g.a === 1) {
+				var colorsProp = gradientProperty.property("Colors");
+				for(var k = 0; k < gradientData.g.k.length; k += 1) {
+					var keyData = gradientData.g.k[k];
+					var time = keyData.t / frameRate;
+					var value = keyData.s[0]; // The value is a flat array [pos1, r1, g1, b1, ...]
+					colorsProp.setValueAtTime(time, value);
+				}
+			}
+
+			// Clean up the temp file
+			tempFile.remove();
+			
+			return gradientProperty;
+
+		} catch(e) {
+			bm_eventDispatcher.log("Error applying gradient: " + e.toString() + " on line: " + e.line);
+			// Ensure cleanup on error
+			var tempFileOnErr = new File(Folder.temp.fsName + "/bm_temp_grad.ffx");
+			if (tempFileOnErr && tempFileOnErr.exists) {
+				tempFileOnErr.remove();
+			}
+			return null;
+		}
+	}
+
+	// Generates the full binary-and-xml string for a .ffx file
+	function generateFfxString(stops, propertyMatchName) {
+		
+		// The binary header seems mostly static, with some bytes indicating content length.
+		// For simplicity, we use a slightly oversized-but-functional header.
+		// This header is derived from a minimal 2-stop gradient preset.
+		var header = "RIFX\x00\x00\x00\x00FaFXhead\x00\x00\x00\x10\x00\x00\x00\x03\x00\x00\x00W\x00\x00\x00\x01\x00\x00\x00\x00LIST\x00\x00\x00\x00bescbeso\x00\x00\x008\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x18\x00\x00\x00\x00\x00\x04\x00\x01\x00\x01\x07\u0080\x048?\u00F0\x00\x00\x00\x00\x00\x00?\u00F0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\u00FF\u00FF\u00FF\u00FFLIST\x00\x00\x01\u0084tdsptdot\x00\x00\x00\x04\u00FF\u00FF\u00FF\u00FFtdpl\x00\x00\x00\x04\x00\x00\x00\x05LIST\x00\x00\x00@tdsitdix\x00\x00\x00\x04\u00FF\u00FF\u00FF\u00FFtdmn\x00\x00\x00(ADBE Root Vectors Group\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00LIST\x00\x00\x00@tdsitdix\x00\x00\x00\x04\x00\x00\x00\x00tdmn\x00\x00\x00(ADBE Vector Group\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00LIST\x00\x00\x00@tdsitdix\x00\x00\x00\x04\u00FF\u00FF\u00FF\u00FFtdmn\x00\x00\x00(ADBE Vectors Group\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00LIST\x00\x00\x00@tdsitdix\x00\x00\x00\x04\x00\x00\x00\x02tdmn\x00\x00\x00(" + propertyMatchName + "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00LIST\x00\x00\x00@tdsitdix\x00\x00\x00\x04\u00FF\u00FF\u00FF\u00FFtdmn\x00\x00\x00(ADBE Vector Grad Colors\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00tdsn\x00\x00\x00\x07Colors\x00\x00LIST\x00\x00\x00dtdsptdot\x00\x00\x00\x04\u00FF\u00FF\u00FF\u00FFtdpl\x00\x00\x00\x04\x00\x00\x00\x01LIST\x00\x00\x00@tdsitdix\x00\x00\x00\x04\u00FF\u00FF\u00FF\u00FFtdmn\x00\x00\x00(ADBE End of path sentinel\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00LIST\x00\x00\x07\u00E8GCstLIST\x00\x00\x00\u00B0tdbstdsb\x00\x00\x00\x04\x00\x00\x00\x01tdsn\x00\x00\x00\x07Colors\x00\x00tdb4\x00\x00\x00|\u00DB\u0099\x00\x01\x00\x07\x00\x00\u00FF\u00FF\u00FF\u00FF\x00\x00\x00?\x1A6\u00E2\u00EB\x1CC-?\u00F0\x00\x00\x00\x00\x00\x00?\u00F0\x00\x00\x00\x00\x00\x00?\u00F0\x00\x00\x00\x00\x00\x00?\u00F0\x00\x00\x00\x00\x00\x00\x00\x01\x00\b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00cdat\x00\x00\x00\x04\x00\x00\x00\x00LIST\x00\x00\x07$GCkyUtf8\x00\x00";
+
+		var stopsCount = stops.length;
+		
+		// Dynamically build the XML content
+		var alphaStopsList = '';
+		var colorStopsList = '';
+		
+		for (var i = 0; i < stopsCount; i++) {
+			var stop = stops[i];
+			alphaStopsList += "<prop.pair>\n<key>Stop-" + i + "</key>\n<prop.list>\n<prop.pair>\n<key>Stops Alpha</key>\n<array>\n<array.type><float/></array.type>\n<float>" + stop.position.toFixed(8) + "</float>\n<float>" + stop.midPoint.toFixed(8) + "</float>\n<float>" + stop.opacity.toFixed(8) + "</float>\n</array>\n</prop.pair>\n</prop.list>\n</prop.pair>\n";
+			colorStopsList += "<prop.pair>\n<key>Stop-" + i + "</key>\n<prop.list>\n<prop.pair>\n<key>Stops Color</key>\n<array>\n<array.type><float/></array.type>\n<float>" + stop.position.toFixed(8) + "</float>\n<float>" + stop.midPoint.toFixed(8) + "</float>\n<float>" + stop.color[0].toFixed(8) + "</float>\n<float>" + stop.color[1].toFixed(8) + "</float>\n<float>" + stop.color[2].toFixed(8) + "</float>\n<float>1</float>\n</array>\n</prop.pair>\n</prop.list>\n</prop.pair>\n";
+		}
+		
+		var xmlContent = "<?xml version='1.0'?>\n<prop.map version='4'>\n<prop.list>\n<prop.pair>\n<key>Gradient Color Data</key>\n<prop.list>\n<prop.pair>\n<key>Alpha Stops</key>\n<prop.list>\n<prop.pair>\n<key>Stops List</key>\n<prop.list>\n" + alphaStopsList + "</prop.list>\n</prop.pair>\n<prop.pair>\n<key>Stops Size</key>\n<int type='unsigned' size='32'>" + stopsCount + "</int>\n</prop.pair>\n</prop.list>\n</prop.pair>\n<prop.pair>\n<key>Color Stops</key>\n<prop.list>\n<prop.pair>\n<key>Stops List</key>\n<prop.list>\n" + colorStopsList + "</prop.list>\n</prop.pair>\n<prop.pair>\n<key>Stops Size</key>\n<int type='unsigned' size='32'>" + stopsCount + "</int>\n</prop.pair>\n</prop.list>\n</prop.pair>\n</prop.list>\n</prop.pair>\n<prop.pair>\n<key>Gradient Colors</key>\n<string>1.0</string>\n</prop.pair>\n</prop.list>\n</prop.map>\n";
+
+		var footer = '<?xpacket begin="\u00EF\u00BB\u00BF" id="W5M0MpCehiHzreSzNTczkc9d"?>\n<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 5.6-c014 79.156821, 2014/08/29-03:07:50 ">\n <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n  <rdf:Description rdf:about=""\n    xmlns:dc="http://purl.org/dc/elements/1.1/"\n    xmlns:xmp="http://ns.adobe.com/xap/1.0/">\n   <dc:format>application/vnd.adobe.aftereffects.preset-animation</dc:format>\n   <xmp:CreatorTool>Bodymovin Lottie Importer</xmp:CreatorTool>\n  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end="w"?>';
+
+		return header + xmlContent + footer;
+	}
+
+	// This function is now the primary entry point for creating gradient fills.
+	function createGradientFill(elementId, containerId, gradientDataString) {
+		var container = getElementById(containerId);
+		var gradientData = JSON.parse(gradientDataString);
+		// Call the master gradient function for a Fill
+		var gradientProperty = createAndApplyGradient(container, gradientData, "ADBE Vector Graphic - G-Fill");
+		if (gradientProperty) {
+			addElement(elementId, gradientProperty);
+		} else {
+			bm_eventDispatcher.log('Could not create gradient fill for elementId: ' + elementId);
+		}
+	}
+	
+	// This function is now the primary entry point for creating gradient strokes.
+	function createGradientStroke(elementId, containerId, gradientDataString) {
+		var container = getElementById(containerId);
+		var gradientData = JSON.parse(gradientDataString);
+		// Call the master gradient function for a Stroke
+		var gradientProperty = createAndApplyGradient(container, gradientData, "ADBE Vector Graphic - G-Stroke");
+		if (gradientProperty) {
+			addElement(elementId, gradientProperty);
+		} else {
+			bm_eventDispatcher.log('Could not create gradient stroke for elementId: ' + elementId);
+		}
+	}
+	
+	// =================================================================================================
+	// END OF NEW GRADIENT FUNCTIONS
+	// =================================================================================================
 
 	function reset() {
 		elements = {};
